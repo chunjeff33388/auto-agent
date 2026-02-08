@@ -1,7 +1,7 @@
 """
-Autonomous AI Agent - Production Ready
-A web-based autonomous agent similar to Manus/Kimi
-Deployable to Hugging Face Spaces
+🤖 Autonomous AI Agent - Production Ready
+Free deployment to Streamlit Cloud / Render / PythonAnywhere
+Uses Groq API (free tier) - No OpenAI/Anthropic needed
 """
 
 import streamlit as st
@@ -13,774 +13,591 @@ import time
 import threading
 import pandas as pd
 import io
-import base64
 from datetime import datetime
 from typing import Dict, List, Any, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
+
+# ==================== PAGE CONFIG ====================
+
+st.set_page_config(
+    page_title="Autonomous AI Agent",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ==================== CUSTOM CSS ====================
+
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    .log-entry {
+        padding: 8px 12px;
+        margin: 4px 0;
+        border-radius: 8px;
+        font-family: monospace;
+        font-size: 0.9rem;
+    }
+    .log-info { background: #e3f2fd; border-left: 4px solid #2196f3; }
+    .log-success { background: #e8f5e9; border-left: 4px solid #4caf50; }
+    .log-warning { background: #fff3e0; border-left: 4px solid #ff9800; }
+    .log-error { background: #ffebee; border-left: 4px solid #f44336; }
+    .stButton>button {
+        border-radius: 8px;
+        font-weight: 600;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ==================== CONFIGURATION ====================
 
 @dataclass
 class AgentConfig:
-    """Configuration for the autonomous agent"""
     groq_api_key: str = ""
     serpapi_key: str = ""
-    model: str = "llama-3.1-70b-versatile"  # Free tier on Groq
+    model: str = "llama-3.1-70b-versatile"
     max_tokens: int = 4096
     temperature: float = 0.7
     max_iterations: int = 10
-    enable_multi_agent: bool = True
-    max_agents: int = 3
 
 # ==================== MEMORY SYSTEM ====================
 
 class AgentMemory:
-    """Short-term memory for the agent using Streamlit session state"""
+    """Session-based memory for the agent"""
     
     def __init__(self):
-        if 'memory' not in st.session_state:
-            st.session_state.memory = {
+        if 'agent_memory' not in st.session_state:
+            st.session_state.agent_memory = {
                 'conversations': [],
-                'task_history': [],
-                'learnings': [],
-                'current_context': {}
+                'tasks': [],
+                'files': {}
             }
-        self.memory = st.session_state.memory
+        self.memory = st.session_state.agent_memory
     
-    def add_conversation(self, role: str, content: str):
-        """Add to conversation history"""
+    def add_message(self, role: str, content: str):
         self.memory['conversations'].append({
-            'timestamp': datetime.now().isoformat(),
+            'time': datetime.now().strftime("%H:%M:%S"),
             'role': role,
             'content': content
         })
-        # Keep last 20 messages
         self.memory['conversations'] = self.memory['conversations'][-20:]
     
-    def add_task_result(self, task: str, result: Any):
-        """Store task result"""
-        self.memory['task_history'].append({
-            'timestamp': datetime.now().isoformat(),
+    def add_task(self, task: str, result: str):
+        self.memory['tasks'].append({
+            'time': datetime.now().strftime("%H:%M:%S"),
             'task': task,
             'result': result
         })
     
-    def add_learning(self, learning: str):
-        """Store learned information"""
-        self.memory['learnings'].append({
-            'timestamp': datetime.now().isoformat(),
-            'content': learning
-        })
+    def get_recent_context(self, n: int = 5) -> str:
+        recent = self.memory['conversations'][-n:] if self.memory['conversations'] else []
+        return "\n".join([f"{m['role']}: {m['content'][:100]}" for m in recent])
     
-    def get_context(self) -> str:
-        """Get relevant context for current task"""
-        recent_conv = self.memory['conversations'][-5:] if self.memory['conversations'] else []
-        recent_tasks = self.memory['task_history'][-3:] if self.memory['task_history'] else []
-        
-        context = "=== RECENT CONTEXT ===\n"
-        if recent_conv:
-            context += "\nRecent Conversations:\n"
-            for conv in recent_conv:
-                context += f"- {conv['role']}: {conv['content'][:100]}...\n"
-        
-        if recent_tasks:
-            context += "\nRecent Tasks:\n"
-            for task in recent_tasks:
-                context += f"- {task['task'][:100]}... -> {str(task['result'])[:100]}\n"
-        
-        return context
-    
-    def clear(self):
-        """Clear memory"""
-        self.memory = {
-            'conversations': [],
-            'task_history': [],
-            'learnings': [],
-            'current_context': {}
-        }
-        st.session_state.memory = self.memory
+    def store_file(self, name: str, data: bytes, mime: str):
+        self.memory['files'][name] = {'data': data, 'mime': mime}
 
 # ==================== LLM INTERFACE ====================
 
 class GroqLLM:
-    """Interface to Groq API (free tier)"""
+    """Groq API client - FREE TIER (1M tokens/day)"""
+    
+    API_URL = "https://api.groq.com/openai/v1/chat/completions"
     
     def __init__(self, api_key: str, model: str = "llama-3.1-70b-versatile"):
         self.api_key = api_key
         self.model = model
-        self.base_url = "https://api.groq.com/openai/v1"
     
-    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.7, max_tokens: int = 4096) -> str:
-        """Send chat completion request to Groq"""
+    def chat(self, messages: List[Dict], temperature: float = 0.7) -> str:
+        """Send chat request to Groq"""
+        if not self.api_key:
+            return "Error: No API key provided. Get free key from groq.com"
+        
         try:
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "model": self.model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens
-            }
-            
             response = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload,
+                self.API_URL,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": 4096
+                },
                 timeout=60
             )
             
             if response.status_code == 200:
                 return response.json()['choices'][0]['message']['content']
+            elif response.status_code == 429:
+                return "Error: Rate limit exceeded. Groq free tier: 1M tokens/day, 1.5K tokens/min"
             else:
-                error_msg = f"API Error {response.status_code}: {response.text}"
-                st.error(error_msg)
-                return f"Error: {error_msg}"
+                return f"Error {response.status_code}: {response.text[:200]}"
                 
         except requests.exceptions.Timeout:
-            return "Error: Request timed out. Please try again."
+            return "Error: Request timed out (60s). Try a simpler task."
         except Exception as e:
             return f"Error: {str(e)}"
     
-    def generate(self, prompt: str, system_prompt: str = "") -> str:
-        """Generate text from prompt"""
+    def generate(self, prompt: str, system: str = "") -> str:
         messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
+        if system:
+            messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        
         return self.chat(messages)
 
 # ==================== TOOLS ====================
 
-class ToolRegistry:
-    """Registry of available tools for the agent"""
+class Tools:
+    """Available tools for the agent"""
     
     def __init__(self, serpapi_key: str = ""):
         self.serpapi_key = serpapi_key
     
-    def web_search(self, query: str, num_results: int = 5) -> str:
-        """Search the web using DuckDuckGo (free) or SerpAPI"""
+    def web_search(self, query: str, n: int = 5) -> str:
+        """Search web using DuckDuckGo (FREE, no API key)"""
         try:
-            # Try DuckDuckGo first (free, no API key)
-            from duckduckgo_search import DDGS
+            # Using DuckDuckGo HTML endpoint (no library needed)
+            url = "https://html.duckduckgo.com/html/"
+            data = {'q': query, 'kl': 'us-en'}
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
             
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=num_results))
+            response = requests.post(url, data=data, headers=headers, timeout=30)
             
-            if results:
-                output = "=== WEB SEARCH RESULTS ===\n\n"
-                for i, result in enumerate(results, 1):
-                    output += f"{i}. {result['title']}\n"
-                    output += f"   URL: {result['href']}\n"
-                    output += f"   Snippet: {result['body'][:200]}...\n\n"
-                return output
+            # Extract results from HTML
+            from html.parser import HTMLParser
             
-            return "No results found."
+            results = []
+            titles = re.findall(r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', response.text)
+            snippets = re.findall(r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', response.text)
+            
+            for i, (title, snippet) in enumerate(zip(titles[:n], snippets[:n]), 1):
+                clean_title = re.sub('<[^<]+?>', '', title)
+                clean_snippet = re.sub('<[^<]+?>', '', snippet)
+                results.append(f"{i}. {clean_title}\n   {clean_snippet[:150]}...")
+            
+            return "\n\n".join(results) if results else "No results found."
             
         except Exception as e:
-            # Fallback to SerpAPI if available
-            if self.serpapi_key:
-                try:
-                    url = "https://serpapi.com/search"
-                    params = {
-                        "q": query,
-                        "api_key": self.serpapi_key,
-                        "engine": "google",
-                        "num": num_results
-                    }
-                    response = requests.get(url, params=params, timeout=30)
-                    data = response.json()
-                    
-                    output = "=== WEB SEARCH RESULTS ===\n\n"
-                    for i, result in enumerate(data.get('organic_results', [])[:num_results], 1):
-                        output += f"{i}. {result.get('title', 'No title')}\n"
-                        output += f"   URL: {result.get('link', 'No link')}\n"
-                        output += f"   Snippet: {result.get('snippet', 'No snippet')[:200]}...\n\n"
-                    return output
-                    
-                except Exception as e2:
-                    return f"Search error: {str(e)} | SerpAPI error: {str(e2)}"
-            
-            return f"Search error: {str(e)}"
+            # Fallback: return helpful message
+            return f"Search note: Using DuckDuckGo. Query was: '{query}'. Try being more specific."
     
     def fetch_url(self, url: str) -> str:
-        """Fetch content from a URL"""
+        """Fetch webpage content"""
         try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0'
-            }
-            response = requests.get(url, headers=headers, timeout=30)
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+            r = requests.get(url, headers=headers, timeout=30)
             
-            if response.status_code == 200:
-                # Simple HTML to text extraction
-                text = re.sub('<[^<]+?>', '', response.text)
-                text = re.sub('\\s+', ' ', text).strip()
-                return text[:5000]  # Limit length
-            else:
-                return f"Error: HTTP {response.status_code}"
-                
+            if r.status_code == 200:
+                # Simple HTML to text
+                text = re.sub('<[^<]+?>', ' ', r.text)
+                text = re.sub('\s+', ' ', text).strip()
+                return text[:4000]
+            return f"HTTP {r.status_code}"
         except Exception as e:
-            return f"Error fetching URL: {str(e)}"
+            return f"Error: {str(e)}"
     
     def execute_python(self, code: str) -> str:
-        """Safely execute Python code"""
-        # Create restricted environment
-        safe_globals = {
-            "__builtins__": {
-                "len": len,
-                "range": range,
-                "enumerate": enumerate,
-                "zip": zip,
-                "map": map,
-                "filter": filter,
-                "sum": sum,
-                "min": min,
-                "max": max,
-                "abs": abs,
-                "round": round,
-                "str": str,
-                "int": int,
-                "float": float,
-                "list": list,
-                "dict": dict,
-                "set": set,
-                "tuple": tuple,
-                "print": print,
-                "type": type,
-                "isinstance": isinstance,
-                "hasattr": hasattr,
-                "getattr": getattr,
-                "Exception": Exception
-            }
+        """Execute Python code safely"""
+        # Restricted globals
+        safe_builtins = {
+            'len': len, 'range': range, 'enumerate': enumerate,
+            'zip': zip, 'map': map, 'filter': filter,
+            'sum': sum, 'min': min, 'max': max, 'abs': abs,
+            'round': round, 'str': str, 'int': int, 'float': float,
+            'list': list, 'dict': dict, 'set': set, 'tuple': tuple,
+            'print': lambda *args: ' '.join(str(a) for a in args),
+            'type': type, 'isinstance': isinstance,
         }
         
-        # Capture output
+        import io
         import sys
-        from io import StringIO
         
+        stdout = io.StringIO()
         old_stdout = sys.stdout
-        redirected_output = StringIO()
+        sys.stdout = stdout
         
         try:
-            sys.stdout = redirected_output
-            exec(code, safe_globals)
+            exec(code, {"__builtins__": safe_builtins}, {})
             sys.stdout = old_stdout
-            
-            output = redirected_output.getvalue()
-            return output if output else "Code executed successfully (no output)"
-            
+            output = stdout.getvalue()
+            return output if output else "(No output)"
         except Exception as e:
             sys.stdout = old_stdout
-            return f"Error executing code: {str(e)}\n{traceback.format_exc()}"
+            return f"Error: {str(e)}"
     
-    def create_csv(self, data: List[Dict], filename: str = "data.csv") -> bytes:
-        """Create CSV file from data"""
+    def create_csv(self, data: List[Dict]) -> bytes:
+        """Create CSV file"""
         df = pd.DataFrame(data)
-        csv_buffer = io.StringIO()
-        df.to_csv(csv_buffer, index=False)
-        return csv_buffer.getvalue().encode('utf-8')
+        return df.to_csv(index=False).encode('utf-8')
     
-    def create_excel(self, data: List[Dict], filename: str = "data.xlsx") -> bytes:
-        """Create Excel file from data"""
+    def create_excel(self, data: List[Dict]) -> bytes:
+        """Create Excel file"""
         df = pd.DataFrame(data)
-        excel_buffer = io.BytesIO()
-        df.to_excel(excel_buffer, index=False, engine='openpyxl')
-        return excel_buffer.getvalue()
-    
-    def get_image_from_url(self, url: str) -> Optional[bytes]:
-        """Fetch image from URL"""
-        try:
-            response = requests.get(url, timeout=30)
-            if response.status_code == 200 and 'image' in response.headers.get('content-type', ''):
-                return response.content
-            return None
-        except:
-            return None
+        buffer = io.BytesIO()
+        df.to_excel(buffer, index=False, engine='openpyxl')
+        return buffer.getvalue()
 
 # ==================== AUTONOMOUS AGENT ====================
 
 class AutonomousAgent:
-    """Main autonomous agent class"""
+    """Main agent class"""
     
     def __init__(self, config: AgentConfig):
         self.config = config
         self.llm = GroqLLM(config.groq_api_key, config.model)
-        self.tools = ToolRegistry(config.serpapi_key)
+        self.tools = Tools(config.serpapi_key)
         self.memory = AgentMemory()
-        self.execution_log = []
+        self.logs = []
     
-    def log(self, message: str, message_type: str = "info"):
-        """Log message to execution log"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        log_entry = {
-            'timestamp': timestamp,
-            'type': message_type,
+    def log(self, message: str, level: str = "info"):
+        """Add log entry"""
+        entry = {
+            'time': datetime.now().strftime("%H:%M:%S"),
+            'level': level,
             'message': message
         }
-        self.execution_log.append(log_entry)
+        self.logs.append(entry)
         
-        # Also update Streamlit
-        if message_type == "error":
-            st.error(f"[{timestamp}] {message}")
-        elif message_type == "success":
-            st.success(f"[{timestamp}] {message}")
-        elif message_type == "warning":
-            st.warning(f"[{timestamp}] {message}")
-        else:
-            st.info(f"[{timestamp}] {message}")
+        # Display immediately
+        css_class = f"log-{level}"
+        st.markdown(f'<div class="log-entry {css_class}">[{entry["time"]}] {message}</div>', 
+                   unsafe_allow_html=True)
     
-    def plan_task(self, task: str) -> List[Dict]:
-        """Break down task into steps using chain-of-thought"""
-        self.log("🧠 Analyzing task and creating plan...", "info")
+    def plan(self, task: str) -> List[Dict]:
+        """Create execution plan"""
+        self.log("🧠 Analyzing task...", "info")
         
-        context = self.memory.get_context()
+        context = self.memory.get_recent_context()
         
-        planning_prompt = f"""You are an autonomous AI agent. Break down the following task into clear, actionable steps.
+        prompt = f"""Break down this task into steps. Return ONLY JSON array.
 
-{context}
+Context: {context}
 
-TASK: {task}
+Task: {task}
 
-Create a step-by-step plan. Return ONLY a JSON array in this exact format:
-[
-    {{"step": 1, "action": "description of action", "tool": "tool_name or none", "expected_output": "what this should produce"}},
-    {{"step": 2, "action": "description of action", "tool": "tool_name or none", "expected_output": "what this should produce"}}
-]
+Format: [{{"step": 1, "action": "...", "tool": "web_search|fetch_url|execute_python|create_csv|create_excel|none"}}]
 
 Available tools:
-- web_search: Search the internet for information
-- fetch_url: Get content from a specific URL
+- web_search: Search internet
+- fetch_url: Get webpage content
 - execute_python: Run Python code
-- create_csv: Generate a CSV file
-- create_excel: Generate an Excel file
+- create_csv: Make CSV file
+- create_excel: Make Excel file
+- none: Just use LLM
 
-If no tool is needed, use "tool": "none".
+Respond with ONLY valid JSON array."""
 
-Respond with ONLY the JSON array, no other text."""
-
-        response = self.llm.generate(planning_prompt, "You are a task planning assistant. Output only valid JSON.")
+        response = self.llm.generate(prompt, "You are a task planner. Output only JSON.")
         
-        # Extract JSON from response
         try:
-            # Find JSON array in response
-            json_match = re.search(r'\[.*\]', response, re.DOTALL)
-            if json_match:
-                plan = json.loads(json_match.group())
-                self.log(f"✅ Plan created with {len(plan)} steps", "success")
+            match = re.search(r'\[.*\]', response, re.DOTALL)
+            if match:
+                plan = json.loads(match.group())
+                self.log(f"✅ Plan: {len(plan)} steps", "success")
                 return plan
-            else:
-                # Fallback: create simple plan
-                return [{"step": 1, "action": task, "tool": "none", "expected_output": "Complete the task"}]
-        except Exception as e:
-            self.log(f"⚠️ Could not parse plan, using fallback: {str(e)}", "warning")
-            return [{"step": 1, "action": task, "tool": "none", "expected_output": "Complete the task"}]
+        except:
+            pass
+        
+        # Fallback
+        return [{"step": 1, "action": task, "tool": "none"}]
     
-    def execute_step(self, step: Dict, task: str) -> str:
-        """Execute a single step"""
+    def execute_step(self, step: Dict) -> str:
+        """Execute one step"""
         action = step.get('action', '')
         tool = step.get('tool', 'none')
-        expected = step.get('expected_output', '')
         
-        self.log(f"▶️ Executing: {action[:80]}...", "info")
-        
-        result = ""
+        self.log(f"▶️ Step {step.get('step', '?')}: {action[:60]}...", "info")
         
         try:
             if tool == 'web_search':
-                # Extract search query from action
-                query = action.replace('Search', '').replace('search for', '').replace('search', '').strip()
-                result = self.tools.web_search(query)
-                
+                query = re.sub(r'^(search|find|look up)\s+', '', action, flags=re.I)
+                return self.tools.web_search(query)
+            
             elif tool == 'fetch_url':
-                # Extract URL
-                urls = re.findall(r'https?://[^\s<>\"{}|\\^`\[\]]+', action)
+                urls = re.findall(r'https?://\S+', action)
                 if urls:
-                    result = self.tools.fetch_url(urls[0])
-                else:
-                    result = "No URL found in action"
-                    
+                    return self.tools.fetch_url(urls[0])
+                return "No URL found"
+            
             elif tool == 'execute_python':
-                # Extract code (assume it's after a code block or the whole action)
+                # Extract code or generate it
                 code_match = re.search(r'```python\s*(.*?)\s*```', action, re.DOTALL)
                 if code_match:
                     code = code_match.group(1)
                 else:
-                    # Generate code using LLM
-                    code_prompt = f"Write Python code to: {action}\n\nReturn ONLY the code, no explanation."
-                    code = self.llm.generate(code_prompt, "You are a Python programmer.")
+                    code_prompt = f"Write Python code for: {action}\nReturn ONLY code, no explanation."
+                    code = self.llm.generate(code_prompt, "You write Python code.")
                 
-                result = self.tools.execute_python(code)
-                
+                return self.tools.execute_python(code)
+            
             elif tool == 'create_csv':
-                # Generate data using LLM
-                data_prompt = f"""Generate sample data for: {action}
-Return as a JSON array of objects. Example: [{{"name": "John", "age": 30}}, ...]"""
-                data_response = self.llm.generate(data_prompt)
-                try:
-                    json_match = re.search(r'\[.*\]', data_response, re.DOTALL)
-                    if json_match:
-                        data = json.loads(json_match.group())
-                        csv_bytes = self.tools.create_csv(data)
-                        result = f"CSV created with {len(data)} rows. Download available."
-                        # Store for download
-                        st.session_state['generated_csv'] = csv_bytes
-                        st.session_state['csv_filename'] = "output.csv"
-                    else:
-                        result = "Failed to generate data"
-                except Exception as e:
-                    result = f"Error creating CSV: {str(e)}"
-                    
-            elif tool == 'create_excel':
-                data_prompt = f"""Generate sample data for: {action}
-Return as a JSON array of objects."""
-                data_response = self.llm.generate(data_prompt)
-                try:
-                    json_match = re.search(r'\[.*\]', data_response, re.DOTALL)
-                    if json_match:
-                        data = json.loads(json_match.group())
-                        excel_bytes = self.tools.create_excel(data)
-                        result = f"Excel file created with {len(data)} rows. Download available."
-                        st.session_state['generated_excel'] = excel_bytes
-                        st.session_state['excel_filename'] = "output.xlsx"
-                    else:
-                        result = "Failed to generate data"
-                except Exception as e:
-                    result = f"Error creating Excel: {str(e)}"
-            else:
-                # No tool - use LLM directly
-                result = self.llm.generate(action, "You are a helpful assistant completing a task.")
-            
-            self.log(f"✅ Step completed", "success")
-            return result
-            
-        except Exception as e:
-            error_msg = f"❌ Step failed: {str(e)}"
-            self.log(error_msg, "error")
-            return error_msg
-    
-    def reflect_and_correct(self, step: Dict, result: str, expected: str) -> bool:
-        """Review step result and determine if retry is needed"""
-        if "Error" in result or "failed" in result.lower():
-            self.log("🔄 Error detected, analyzing for retry...", "warning")
-            return True
-        return False
-    
-    def execute_task(self, task: str) -> str:
-        """Execute full task with planning and execution"""
-        self.execution_log = []
-        self.log(f"🚀 Starting task: {task[:100]}...", "info")
-        
-        # Add to memory
-        self.memory.add_conversation("user", task)
-        
-        # Create plan
-        plan = self.plan_task(task)
-        
-        # Display plan
-        with st.expander("📋 Execution Plan", expanded=True):
-            for step in plan:
-                st.write(f"**Step {step['step']}:** {step['action']}")
-                st.caption(f"Tool: {step['tool']} | Expected: {step['expected_output']}")
-        
-        # Execute steps
-        results = []
-        for step in plan[:self.config.max_iterations]:
-            with st.spinner(f"Executing step {step['step']}..."):
-                result = self.execute_step(step, task)
-                results.append({
-                    'step': step['step'],
-                    'action': step['action'],
-                    'result': result
-                })
+                # Generate sample data
+                data_prompt = f"Generate JSON array of data for: {action}\nFormat: [{{'col1': 'val1', ...}}]"
+                response = self.llm.generate(data_prompt)
                 
-                # Check if retry needed
-                if self.reflect_and_correct(step, result, step.get('expected_output', '')):
-                    self.log("🔄 Retrying with modified approach...", "warning")
-                    # Modify step and retry
-                    step['action'] += " (Retry with simpler approach)"
-                    result = self.execute_step(step, task)
-                    results[-1]['result'] = result
+                try:
+                    match = re.search(r'\[.*\]', response, re.DOTALL)
+                    if match:
+                        data = json.loads(match.group())
+                        csv_bytes = self.tools.create_csv(data)
+                        self.memory.store_file('output.csv', csv_bytes, 'text/csv')
+                        return f"✅ CSV created with {len(data)} rows"
+                except Exception as e:
+                    return f"CSV error: {str(e)}"
+            
+            elif tool == 'create_excel':
+                data_prompt = f"Generate JSON array of data for: {action}\nFormat: [{{'col1': 'val1', ...}}]"
+                response = self.llm.generate(data_prompt)
+                
+                try:
+                    match = re.search(r'\[.*\]', response, re.DOTALL)
+                    if match:
+                        data = json.loads(match.group())
+                        excel_bytes = self.tools.create_excel(data)
+                        self.memory.store_file('output.xlsx', excel_bytes, 
+                            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                        return f"✅ Excel created with {len(data)} rows"
+                except Exception as e:
+                    return f"Excel error: {str(e)}"
+            
+            else:
+                # No tool - direct LLM
+                return self.llm.generate(action)
+                
+        except Exception as e:
+            self.log(f"❌ Error: {str(e)}", "error")
+            return f"Error: {str(e)}"
+    
+    def execute(self, task: str) -> str:
+        """Execute full task"""
+        self.logs = []
+        self.log(f"🚀 Starting: {task[:80]}...", "info")
         
-        # Generate final summary
-        self.log("📝 Generating final response...", "info")
+        self.memory.add_message("user", task)
         
-        summary_prompt = f"""Task: {task}
-
-Execution Results:
-{json.dumps(results, indent=2)}
-
-Provide a comprehensive summary of what was accomplished. Include key findings, data insights, and any files generated. Be thorough but concise."""
-
-        final_response = self.llm.generate(summary_prompt, "You are summarizing task execution results.")
+        # Plan
+        plan = self.plan(task)
         
-        self.memory.add_task_result(task, final_response)
-        self.memory.add_conversation("assistant", final_response)
+        with st.expander("📋 Execution Plan", expanded=True):
+            for p in plan:
+                st.write(f"**{p['step']}.** {p['action']} *(tool: {p['tool']})*")
         
-        self.log("✅ Task completed!", "success")
+        # Execute
+        results = []
+        progress_bar = st.progress(0)
         
-        return final_response
+        for i, step in enumerate(plan):
+            progress = (i + 1) / len(plan)
+            progress_bar.progress(min(progress, 0.99))
+            
+            result = self.execute_step(step)
+            results.append({'step': step['step'], 'result': result})
+            
+            # Check for errors
+            if 'Error' in result and 'rate limit' not in result.lower():
+                self.log("🔄 Retrying with simpler approach...", "warning")
+                step['action'] += " (simpler version)"
+                result = self.execute_step(step)
+                results[-1]['result'] = result
+        
+        progress_bar.empty()
+        
+        # Summary
+        self.log("📝 Generating summary...", "info")
+        
+        summary_prompt = f"""Summarize these results concisely:
 
-# ==================== MULTI-AGENT SWARM ====================
+Task: {task}
 
-class AgentSwarm:
-    """Multi-agent coordination for parallel task execution"""
+Results: {json.dumps(results, indent=2)}
+
+Provide key findings and any recommendations."""
+        
+        summary = self.llm.generate(summary_prompt, "You summarize task results.")
+        self.memory.add_task(task, summary)
+        self.memory.add_message("assistant", summary)
+        
+        self.log("✅ Complete!", "success")
+        
+        return summary
+
+# ==================== MULTI-AGENT ====================
+
+class MultiAgent:
+    """Parallel agent execution"""
     
     def __init__(self, config: AgentConfig):
         self.config = config
-        self.agents = []
     
-    def create_sub_agents(self, subtasks: List[str]) -> List[AutonomousAgent]:
-        """Create agents for each subtask"""
-        agents = []
-        for i, subtask in enumerate(subtasks[:self.config.max_agents]):
-            agent = AutonomousAgent(self.config)
-            agents.append((subtask, agent))
-        return agents
-    
-    def execute_parallel(self, main_task: str) -> Dict[str, str]:
-        """Execute subtasks in parallel"""
-        # First, break down the main task
-        llm = GroqLLM(self.config.groq_api_key, self.config.model)
+    def run(self, task: str) -> Dict[str, str]:
+        """Execute with multiple parallel agents"""
         
-        breakdown_prompt = f"""Break down this task into 2-3 parallel subtasks that can be executed simultaneously:
+        # Break down task
+        llm = GroqLLM(self.config.groq_api_key, self.config.model)
+        prompt = f"""Split this task into 2-3 parallel subtasks. Return JSON array.
 
-Task: {main_task}
+Task: {task}
 
-Return as JSON array: [{{"subtask": "description", "focus": "what to focus on"}}]"""
+Format: [{{"subtask": "description", "focus": "what to research"}}]"""
 
-        response = llm.generate(breakdown_prompt)
+        response = llm.generate(prompt)
         
         try:
-            json_match = re.search(r'\[.*\]', response, re.DOTALL)
-            if json_match:
-                subtasks_data = json.loads(json_match.group())
-                subtasks = [s['subtask'] for s in subtasks_data]
-            else:
-                subtasks = [main_task]
+            match = re.search(r'\[.*\]', response, re.DOTALL)
+            subtasks = json.loads(match.group()) if match else [{"subtask": task}]
         except:
-            subtasks = [main_task]
+            subtasks = [{"subtask": task}]
         
         # Execute in parallel
         results = {}
         
-        with ThreadPoolExecutor(max_workers=self.config.max_agents) as executor:
-            future_to_task = {}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {}
             
-            for subtask in subtasks:
+            for st in subtasks[:3]:
                 agent = AutonomousAgent(self.config)
-                future = executor.submit(agent.execute_task, subtask)
-                future_to_task[future] = subtask
+                future = executor.submit(agent.execute, st['subtask'])
+                futures[future] = st['subtask']
             
-            for future in as_completed(future_to_task):
-                subtask = future_to_task[future]
+            for future in as_completed(futures):
+                subtask = futures[future]
                 try:
-                    result = future.result()
-                    results[subtask] = result
+                    results[subtask] = future.result()
                 except Exception as e:
                     results[subtask] = f"Error: {str(e)}"
         
         return results
 
-# ==================== STREAMLIT UI ====================
+# ==================== UI ====================
 
-def init_session_state():
-    """Initialize Streamlit session state"""
-    if 'agent_config' not in st.session_state:
-        st.session_state.agent_config = None
-    if 'chat_history' not in st.session_state:
-        st.session_state.chat_history = []
-    if 'generated_files' not in st.session_state:
-        st.session_state.generated_files = {}
-
-def render_sidebar():
-    """Render sidebar with configuration"""
+def sidebar():
+    """Sidebar configuration"""
     with st.sidebar:
-        st.title("⚙️ Configuration")
+        st.title("⚙️ Settings")
         
         # API Keys
-        st.subheader("API Keys")
+        st.subheader("API Keys (Free)")
+        
         groq_key = st.text_input(
             "Groq API Key",
             type="password",
-            value=os.getenv("GROQ_API_KEY", ""),
-            help="Get free key from groq.com"
+            value=st.secrets.get("GROQ_API_KEY", "") if hasattr(st, 'secrets') else "",
+            help="Get FREE key from groq.com (1M tokens/day)"
         )
         
         serpapi_key = st.text_input(
             "SerpAPI Key (Optional)",
             type="password",
-            value=os.getenv("SERPAPI_KEY", ""),
-            help="Get from serpapi.com (100 free searches/month)"
+            value=st.secrets.get("SERPAPI_KEY", "") if hasattr(st, 'secrets') else "",
+            help="100 free searches/month at serpapi.com"
         )
         
-        # Model selection
-        st.subheader("Model Settings")
+        st.divider()
+        
+        # Model
         model = st.selectbox(
-            "LLM Model",
-            ["llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma-7b-it"],
-            help="Llama 3.1 70B recommended for best results"
+            "Model",
+            ["llama-3.1-70b-versatile", "llama-3.1-8b-instant", 
+             "mixtral-8x7b-32768", "gemma2-9b-it"],
+            help="70B = best quality, 8B = faster"
         )
         
-        temperature = st.slider("Temperature", 0.0, 1.0, 0.7, 0.1)
+        temp = st.slider("Creativity", 0.0, 1.0, 0.7)
         
-        # Multi-agent toggle
-        enable_swarm = st.toggle("Enable Multi-Agent Swarm", value=True)
-        
-        # Save config
-        if st.button("💾 Save Configuration"):
-            st.session_state.agent_config = AgentConfig(
-                groq_api_key=groq_key,
-                serpapi_key=serpapi_key,
-                model=model,
-                temperature=temperature,
-                enable_multi_agent=enable_swarm
-            )
-            st.success("Configuration saved!")
+        use_multi = st.toggle("Multi-Agent Mode", value=False)
         
         st.divider()
         
-        # Clear memory
-        if st.button("🗑️ Clear Memory"):
-            if 'memory' in st.session_state:
-                del st.session_state.memory
-            st.session_state.chat_history = []
-            st.success("Memory cleared!")
-        
-        # Help section
-        st.divider()
-        st.subheader("📖 Help")
-        st.markdown("""
-        **Getting Started:**
-        1. Enter your Groq API key
-        2. Click Save Configuration
-        3. Enter a task in the main area
-        4. Click Execute Task
-        
-        **Example Tasks:**
-        - "Research the top 5 AI companies and create a CSV"
-        - "Write a Python script to calculate fibonacci"
-        - "Search for climate change data and summarize"
+        # About
+        st.caption("""
+        **Free Tier Limits:**
+        - Groq: 1M tokens/day
+        - DuckDuckGo: Unlimited
+        - SerpAPI: 100/day (optional)
         """)
+        
+        return AgentConfig(
+            groq_api_key=groq_key,
+            serpapi_key=serpapi_key,
+            model=model,
+            temperature=temp
+        ), use_multi
 
-def render_main_interface():
-    """Render main chat interface"""
-    st.title("🤖 Autonomous AI Agent")
-    st.caption("Powered by Groq (Free Tier) | No OpenAI/Anthropic API needed")
+def main():
+    """Main app"""
+    st.markdown('<p class="main-header">🤖 Autonomous AI Agent</p>', unsafe_allow_html=True)
+    st.caption("Powered by Groq FREE API | No OpenAI/Anthropic required")
     
-    # Check if configured
-    if st.session_state.agent_config is None:
-        st.warning("⚠️ Please configure your API keys in the sidebar first!")
-        return
+    config, use_multi = sidebar()
     
-    config = st.session_state.agent_config
-    
+    # Check API key
     if not config.groq_api_key:
-        st.error("❌ Groq API key is required! Get a free key from groq.com")
+        st.warning("⚠️ Please enter your Groq API key in the sidebar")
+        st.info("""
+        **Get FREE API Key:**
+        1. Go to [groq.com](https://groq.com)
+        2. Sign up (free, no credit card)
+        3. Create API key at [console.groq.com/keys](https://console.groq.com/keys)
+        4. Paste key in sidebar
+        """)
         return
     
     # Task input
-    st.subheader("📝 Enter Your Task")
+    st.subheader("📝 Your Task")
     task = st.text_area(
-        "What would you like me to do?",
-        placeholder="Example: Research the latest AI trends, find 5 articles, and create a summary report with citations...",
+        "What should I do?",
+        placeholder="Examples:\n• Research top 5 AI companies and create a CSV\n• Write Python to calculate prime numbers\n• Search for renewable energy stats and summarize",
         height=100
     )
     
-    # Execution options
-    col1, col2, col3 = st.columns([1, 1, 2])
-    
+    col1, col2 = st.columns([1, 4])
     with col1:
-        use_swarm = st.checkbox("Use Multi-Agent", value=config.enable_multi_agent)
+        run_btn = st.button("🚀 Execute", type="primary", use_container_width=True)
     
-    with col2:
-        show_details = st.checkbox("Show detailed logs", value=True)
-    
-    with col3:
-        execute_btn = st.button("🚀 Execute Task", type="primary", use_container_width=True)
-    
-    # Execute task
-    if execute_btn and task:
-        # Create log container
+    # Execute
+    if run_btn and task:
+        st.divider()
+        st.subheader("📊 Execution Log")
+        
         log_container = st.container()
         
         with log_container:
-            st.subheader("📊 Execution Log")
-            log_placeholder = st.empty()
+            if use_multi:
+                st.info("🐝 Running multi-agent swarm...")
+                multi = MultiAgent(config)
+                results = multi.run(task)
+                
+                st.subheader("📋 Combined Results")
+                for subtask, result in results.items():
+                    with st.expander(f"Agent: {subtask[:60]}..."):
+                        st.write(result)
+            else:
+                agent = AutonomousAgent(config)
+                result = agent.execute(task)
+                
+                st.subheader("📋 Final Result")
+                st.markdown(result)
         
-        # Execute
-        if use_swarm:
-            st.info("🐝 Using multi-agent swarm for parallel execution...")
-            swarm = AgentSwarm(config)
-            results = swarm.execute_parallel(task)
-            
-            st.subheader("📋 Results from All Agents")
-            for subtask, result in results.items():
-                with st.expander(f"Agent: {subtask[:80]}..."):
-                    st.write(result)
-        else:
-            agent = AutonomousAgent(config)
-            result = agent.execute_task(task)
-            
-            st.subheader("📋 Final Result")
-            st.markdown(result)
+        # File downloads
+        memory = AgentMemory()
+        if 'output.csv' in memory.memory['files']:
+            f = memory.memory['files']['output.csv']
+            st.download_button("📥 Download CSV", f['data'], "output.csv", "text/csv")
         
-        # Show downloads if files generated
-        if 'generated_csv' in st.session_state:
-            st.download_button(
-                "📥 Download CSV",
-                st.session_state['generated_csv'],
-                st.session_state.get('csv_filename', 'output.csv'),
-                "text/csv"
-            )
-        
-        if 'generated_excel' in st.session_state:
-            st.download_button(
-                "📥 Download Excel",
-                st.session_state['generated_excel'],
-                st.session_state.get('excel_filename', 'output.xlsx'),
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        
-        # Add to chat history
-        st.session_state.chat_history.append({
-            'task': task,
-            'timestamp': datetime.now().isoformat()
-        })
-
-def render_chat_history():
-    """Render previous tasks"""
-    if st.session_state.chat_history:
-        with st.sidebar:
-            st.divider()
-            st.subheader("📜 Recent Tasks")
-            for item in reversed(st.session_state.chat_history[-5:]):
-                st.caption(f"• {item['task'][:50]}...")
-
-def main():
-    """Main application"""
-    st.set_page_config(
-        page_title="Autonomous AI Agent",
-        page_icon="🤖",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
-    init_session_state()
-    render_sidebar()
-    render_main_interface()
-    render_chat_history()
-    
-    # Footer
-    st.divider()
-    st.caption("""
-    🤖 Autonomous AI Agent | Built with Streamlit + Groq API (Free Tier)
-    Deploy to Hugging Face Spaces for free web hosting!
-    """)
+        if 'output.xlsx' in memory.memory['files']:
+            f = memory.memory['files']['output.xlsx']
+            st.download_button("📥 Download Excel", f['data'], "output.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 if __name__ == "__main__":
     main()
